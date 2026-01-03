@@ -8,12 +8,96 @@ $message = '';
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_payment_status'])) {
     $payment_id = (int)$_POST['payment_id'];
     $status = sanitize($_POST['status']);
-    $stmt = $db->prepare("UPDATE payments SET status = ? WHERE id = ?");
-    $stmt->bind_param("si", $payment_id, $status);
-    if ($stmt->execute()) {
+    
+    // Start transaction
+    $db->begin_transaction();
+    
+    try {
+        // Update payment status
+        $stmt = $db->prepare("UPDATE payments SET status = ?, paid_at = ? WHERE id = ?");
+        $paid_at = ($status === 'paid') ? date('Y-m-d H:i:s') : null;
+        $stmt->bind_param("ssi", $status, $paid_at, $payment_id);
+        $stmt->execute();
+        
+        // Get order_id from payment
+        $stmt = $db->prepare("SELECT order_id FROM payments WHERE id = ?");
+        $stmt->bind_param("i", $payment_id);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        $payment = $result->fetch_assoc();
+        $order_id = $payment['order_id'];
+        
+        if ($status === 'paid') {
+            // Update order status to processing
+            $stmt = $db->prepare("UPDATE orders SET status = 'processing' WHERE id = ?");
+            $stmt->bind_param("i", $order_id);
+            $stmt->execute();
+            
+            // Get order details for topup log
+            $stmt = $db->prepare("
+                SELECT o.game_user_id, o.nickname, oi.product_id, oi.package_id, oi.quantity, 
+                       dp.name as product_name, pp.amount, g.name as game_name
+                FROM orders o 
+                JOIN order_items oi ON o.id = oi.order_id 
+                JOIN digital_products dp ON oi.product_id = dp.id 
+                JOIN product_packages pp ON oi.package_id = pp.id 
+                JOIN games g ON o.game_id = g.id 
+                WHERE o.id = ?
+            ");
+            $stmt->bind_param("i", $order_id);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            
+            $order_items = [];
+            while ($item = $result->fetch_assoc()) {
+                $order_items[] = $item;
+            }
+            
+            // Create topup request data (simulated API call data)
+            $request_data = json_encode([
+                'order_id' => $order_id,
+                'game_user_id' => $order_items[0]['game_user_id'],
+                'nickname' => $order_items[0]['nickname'],
+                'game' => $order_items[0]['game_name'],
+                'items' => array_map(function($item) {
+                    return [
+                        'product' => $item['product_name'],
+                        'amount' => $item['amount'],
+                        'quantity' => $item['quantity']
+                    ];
+                }, $order_items)
+            ]);
+            
+            // Simulate API response (in real implementation, this would be from actual API call)
+            $response_data = json_encode([
+                'status' => 'success',
+                'message' => 'Topup processed successfully',
+                'transaction_id' => 'TXN_' . $order_id . '_' . time()
+            ]);
+            
+            // Insert topup log
+            $stmt = $db->prepare("INSERT INTO topup_logs (order_id, request_data, response_data, status) VALUES (?, ?, ?, 'success')");
+            $stmt->bind_param("iss", $order_id, $request_data, $response_data);
+            $stmt->execute();
+            
+            // Update order status to completed
+            $stmt = $db->prepare("UPDATE orders SET status = 'completed' WHERE id = ?");
+            $stmt->bind_param("i", $order_id);
+            $stmt->execute();
+            
+        } elseif ($status === 'failed' || $status === 'expired') {
+            // Update order status to failed
+            $stmt = $db->prepare("UPDATE orders SET status = 'failed' WHERE id = ?");
+            $stmt->bind_param("i", $order_id);
+            $stmt->execute();
+        }
+        
+        $db->commit();
         $message = "Payment status updated successfully.";
-    } else {
-        $message = "Error updating payment status.";
+        
+    } catch (Exception $e) {
+        $db->rollback();
+        $message = "Error updating payment status: " . $e->getMessage();
     }
 }
 
